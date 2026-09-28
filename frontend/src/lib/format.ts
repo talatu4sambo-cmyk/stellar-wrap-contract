@@ -94,6 +94,106 @@ export function formatTimestamp(timestamp: bigint): string {
   }).format(new Date(Number(timestamp) * 1000));
 }
 
+/**
+ * The lifecycle state of a wrap record. The contract supports revoke, burn,
+ * opt-out, and expiration, so a record is more than simply "exists".
+ */
+export type WrapRecordState =
+  | "active"
+  | "revoked"
+  | "burned"
+  | "expired"
+  | "opted-out";
+
+export interface WrapRecordStateInfo {
+  state: WrapRecordState;
+  label: string;
+  description: string;
+  /** Whether the record still represents something the user holds. */
+  held: boolean;
+}
+
+const WRAP_RECORD_STATES: Record<WrapRecordState, Omit<WrapRecordStateInfo, "state">> = {
+  active: {
+    label: "Active",
+    description: "This record is valid and currently held by you.",
+    held: true,
+  },
+  revoked: {
+    label: "Revoked",
+    description: "This record was revoked by the issuer and is no longer valid.",
+    held: false,
+  },
+  burned: {
+    label: "Burned",
+    description: "This record was burned and no longer exists on-chain.",
+    held: false,
+  },
+  expired: {
+    label: "Expired",
+    description: "This record passed its expiration period and is no longer valid.",
+    held: false,
+  },
+  "opted-out": {
+    label: "Opted out",
+    description: "You opted out of this record, so it is no longer held.",
+    held: false,
+  },
+};
+
+/**
+ * Resolve the display state of a wrap record. Explicit flags on the record
+ * take precedence, and a record whose period has passed is treated as expired.
+ */
+export function wrapRecordState(
+  record: Pick<WrapRecord, "period"> & Partial<WrapRecord>,
+  now: Date = new Date(),
+): WrapRecordStateInfo {
+  const flags = record as Partial<Record<WrapRecordState, unknown>>;
+  let state: WrapRecordState = "active";
+
+  if (flags.burned) {
+    state = "burned";
+  } else if (flags.revoked) {
+    state = "revoked";
+  } else if (flags.optedOut || flags["opted-out"]) {
+    state = "opted-out";
+  } else if (flags.expired || isPeriodExpired(record.period, now)) {
+    state = "expired";
+  }
+
+  return { state, ...WRAP_RECORD_STATES[state] };
+}
+
+function isPeriodExpired(period: bigint, now: Date): boolean {
+  const currentPeriod = BigInt(now.getUTCFullYear() * 100 + (now.getUTCMonth() + 1));
+  return period < currentPeriod;
+}
+
+/**
+ * Render a `YYYYMM` period in a readable form (e.g. "March 2025") while the
+ * raw integer value remains available on the record itself.
+ */
+export function formatPeriod(period: bigint): string {
+  const value = period.toString().padStart(6, "0");
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(4));
+  if (!Number.isFinite(year) || month < 1 || month > 12) {
+    return value;
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(new Date(Date.UTC(year, month - 1, 1)));
+}
+
+/**
+ * Wrap records are soulbound: they cannot be transferred between accounts.
+ */
+export const SOULBOUND_NOTICE =
+  "Wrap records are soulbound and cannot be transferred to another account.";
+
 export function errorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;

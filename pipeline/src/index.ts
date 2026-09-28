@@ -106,6 +106,45 @@ function recordReconciliationRun(db: IndexerDB, run: ReconciliationRun): void {
   }
 }
 
+/**
+ * Resolve the ledger to resume from on startup.
+ *
+ * The persisted cursor is authoritative: it is written transactionally with
+ * the derived state, so it always reflects the last fully-processed ledger.
+ * `START_LEDGER` is only consulted on a genuine first run (no cursor yet).
+ *
+ * If the persisted cursor is ahead of the chain head the indexer refuses to
+ * start rather than spinning on a ledger the chain has not produced.
+ */
+async function resolveStartLedger(
+  db: IndexerDB,
+  fetcher: SorobanFetcher,
+  contractId: string,
+  firstRunDefault: number,
+): Promise<number> {
+  const cursor = db.getCursor(`cursor:${contractId}`);
+
+  if (!cursor) {
+    console.log(`No persisted cursor; starting from START_LEDGER=${firstRunDefault}`);
+    return firstRunDefault;
+  }
+
+  const chainHead = await fetcher.getLatestLedger();
+  if (cursor.last_processed_ledger > chainHead) {
+    throw new Error(
+      `Persisted cursor (ledger ${cursor.last_processed_ledger}) is ahead of the ` +
+        `chain head (ledger ${chainHead}). Refusing to start; the database may ` +
+        `belong to a different network or the chain may have been reset.`,
+    );
+  }
+
+  console.log(
+    `Resuming from persisted cursor at ledger ${cursor.last_processed_ledger} ` +
+      `(chain head ${chainHead})`,
+  );
+  return cursor.last_processed_ledger + 1;
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const db = await IndexerDB.create(config.db_path);
@@ -237,75 +276,57 @@ async function main(): Promise<void> {
   // ── Live indexing mode ─────────────────────────────────────────────
   console.log('\nStarting live indexing...');
 
-  // Determine starting ledger from cursor or start_ledger config
-  const cursor = db.getCursor(`cursor:${config.contract_id}`);
-  let startLedger = cursor ? cursor.last_processed_ledger + 1 : config.start_ledger;
+  // Resume from the persisted cursor when present; START_LEDGER is a
+  // first-run default only. Refuse to start if the cursor is ahead of the
+  // chain head instead of spinning on a ledger the chain has not produced.
+  let startLedger: number;
+  try {
+    startLedger = await resolveStartLedger(db, fetcher, config.contract_id, config.start_ledger);
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : err);
+    db.close();
+    process.exit(1);
+  }
 
   // Initialize state from DB or create empty
   let state: DerivedState;
-  const existingState = db.getContractState(config.contract_id);
-  if (existingState) {
-    state = createEmptyState(config.contract_id, startLedger);
-    // Load wraps from DB
-    console.log('Loading existing indexed state...');
+  const persistedState = db.getDerivedState(config.contract_id);
+  if (persistedState) {
+    state = persistedState;
   } else {
-    state = createEmptyState(config.contract_id, startLedger);
+    state = createEmptyState(config.contract_id);
   }
 
-  console.log(`Starting from ledger ${startLedger}`);
-  console.log(`Polling every ${config.poll_interval_ms}ms\n`);
-
-  // Main polling loop
-  let consecutiveErrors = 0;
+  // The cursor and the derived state are written together in a single
+  // transaction by persistStateToDB, so a restart can never observe a cursor
+  // that disagrees with the data derived from it.
+  let lastProcessedLedger = startLedger - 1;
 
   while (true) {
-    try {
-      const { events, latestLedger } = await fetcher.fetchEvents(startLedger);
+    const batch = await fetcher.fetchEvents(startLedger, config.event_page_size);
 
-      if (events.length > 0) {
-        const processed = processEventBatch(db, state, events);
-        const firstLedger = events[0].ledger;
-        const lastLedger = events[events.length - 1].ledger;
-        console.log(
-          `[${new Date().toISOString()}] Indexed ${processed} events ` +
-          `(ledgers ${firstLedger}-${lastLedger}, latest: ${latestLedger})`,
-        );
-      }
-
-      if (latestLedger > 0) {
-        startLedger = latestLedger + 1;
-        db.upsertCursor(
-          `cursor:${config.contract_id}`,
-          config.contract_id,
-          latestLedger,
-          latestLedger,
-        );
-      }
-
-      consecutiveErrors = 0;
-
-    } catch (err) {
-      consecutiveErrors++;
-      console.error(`Error (${consecutiveErrors}):`, err instanceof Error ? err.message : err);
-
-      if (consecutiveErrors >= 10) {
-        console.error('Too many consecutive errors. Exiting.');
-        break;
-      }
+    if (batch.events.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, config.poll_interval_ms));
+      continue;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, config.poll_interval_ms));
-  }
+    const result = processEventBatch(state, batch.events);
+    state = result.state;
 
-  db.close();
+    const batchLedger = batch.events.reduce(
+      (max, event) => Math.max(max, event.ledger),
+      lastProcessedLedger,
+    );
+
+    persistStateToDB(db, state, config.contract_id, batchLedger);
+    lastProcessedLedger = batchLedger;
+    startLedger = batchLedger + 1;
+
+    console.log(`Processed ${batch.events.length} events up to ledger ${batchLedger}`);
+  }
 }
 
-process.on('unhandledRejection', (err) => {
-  console.error('Unhandled rejection:', err);
-  process.exit(1);
-});
-
 main().catch((err) => {
-  console.error('Fatal error:', err);
+  console.error('Fatal error:', err instanceof Error ? err.message : err);
   process.exit(1);
 });

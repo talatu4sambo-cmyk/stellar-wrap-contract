@@ -19,6 +19,8 @@ export function loadConfig(): IndexerConfig {
     db_path: process.env.DB_PATH || path.resolve(__dirname, '../indexer.db'),
     poll_interval_ms: parseInt(process.env.POLL_INTERVAL_MS || '5000', 10),
     event_page_size: parseInt(process.env.EVENT_PAGE_SIZE || '100', 10),
+    // START_LEDGER is a first-run default only: once a cursor has been
+    // persisted, the indexer resumes from it and ignores this value.
     start_ledger: parseInt(process.env.START_LEDGER || '1', 10),
     backfill: process.argv.includes('--backfill'),
     reconcile_only: process.argv.includes('--reconcile-only'),

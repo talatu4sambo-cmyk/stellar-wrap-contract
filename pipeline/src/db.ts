@@ -215,6 +215,67 @@ export class IndexerDB {
     return rows.map((r) => r.event_id);
   }
 
+  // ─── Ledger cursor ──────────────────────────────────────────────────
+
+  /**
+   * Reads the durable cursor for a contract. Returns null when no cursor has
+   * been persisted yet, which signals a first run (callers fall back to
+   * START_LEDGER).
+   */
+  getLedgerCursor(contractId: string): LedgerCursorRow | null {
+    const row = this.fetchOne(
+      `SELECT * FROM ledger_cursor WHERE contract_id = ?`,
+      [contractId],
+    );
+    return (row as unknown as LedgerCursorRow) ?? null;
+  }
+
+  /**
+   * Persists the last fully-processed ledger together with the derived data
+   * for that ledger in a single transaction, so the cursor and the data it
+   * describes can never disagree across a restart.
+   */
+  commitLedger(
+    contractId: string,
+    lastProcessedLedger: number,
+    lastEventLedger: number,
+    applyDerived: () => void,
+  ): void {
+    this.db.run('BEGIN');
+    try {
+      applyDerived();
+      this.exec(
+        `INSERT INTO ledger_cursor (id, contract_id, last_processed_ledger, last_event_ledger, updated_at)
+         VALUES (?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(id) DO UPDATE SET
+           last_processed_ledger = excluded.last_processed_ledger,
+           last_event_ledger = excluded.last_event_ledger,
+           updated_at = datetime('now')`,
+        [contractId, contractId, lastProcessedLedger, lastEventLedger],
+      );
+      this.db.run('COMMIT');
+    } catch (err) {
+      this.db.run('ROLLBACK');
+      throw err;
+    }
+  }
+
+  /**
+   * Guards against a persisted cursor that is ahead of the chain's current
+   * ledger (e.g. a reset/reorged network). Refuses to proceed instead of
+   * spinning forever waiting for ledgers that will never arrive.
+   */
+  assertCursorNotAhead(contractId: string, chainLedger: number): void {
+    const cursor = this.getLedgerCursor(contractId);
+    if (cursor && cursor.last_processed_ledger > chainLedger) {
+      throw new Error(
+        `Persisted cursor for ${contractId} is at ledger ${cursor.last_processed_ledger}, ` +
+          `ahead of the chain's current ledger ${chainLedger}. Refusing to proceed; ` +
+          `the database may be from a different network or the chain was reset.`,
+      );
+    }
+  }
+
   // ─── Events ─────────────────────────────────────────────────────────
 
   insertEvent(event: {
@@ -250,60 +311,6 @@ export class IndexerDB {
     ) as unknown as EventRow[];
   }
 
-  getLatestEventLedger(contractId: string): number | null {
-    const row = this.fetchOne(
-      `SELECT MAX(ledger_seq) as max_ledger FROM contract_events WHERE contract_id = ?`,
-      [contractId],
-    ) as { max_ledger: number | null } | null;
-    return row?.max_ledger ?? null;
-  }
+  getLatestEventLedger(contractId: string
 
-  // ─── Wrap Records ───────────────────────────────────────────────────
-
-  upsertWrap(record: {
-    contract_id: string;
-    user: string;
-    period: number;
-    timestamp: number;
-    data_hash: string;
-    archetype: string;
-    fsm_state: number;
-    fsm_updated_at: number;
-    ledger_seq: number;
-    tx_hash: string;
-  }): void {
-    this.exec(
-      `INSERT INTO wrap_records
-        (contract_id, user, period, timestamp, data_hash, archetype, fsm_state, fsm_updated_at, ledger_seq, tx_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(contract_id, user, period) DO UPDATE SET
-        timestamp = excluded.timestamp,
-        data_hash = excluded.data_hash,
-        archetype = excluded.archetype,
-        fsm_state = excluded.fsm_state,
-        fsm_updated_at = excluded.fsm_updated_at,
-        ledger_seq = excluded.ledger_seq,
-        tx_hash = excluded.tx_hash,
-        updated_at = datetime('now')`,
-      [record.contract_id, record.user, record.period, record.timestamp, record.data_hash, record.archetype, record.fsm_state, record.fsm_updated_at, record.ledger_seq, record.tx_hash],
-    );
-  }
-
-  removeWrap(contractId: string, user: string, period: number): void {
-    this.exec(
-      `DELETE FROM wrap_records WHERE contract_id = ? AND user = ? AND period = ?`,
-      [contractId, user, period],
-    );
-  }
-
-  getWrapCount(contractId: string): number {
-    const row = this.fetchOne(
-      `SELECT COUNT(*) as count FROM wrap_records WHERE contract_id = ?`,
-      [contractId],
-    ) as { count: number };
-    return row.count;
-  }
-
-  // ─── User State ─────────────────────────────────
-
-/* … truncated 5114 chars — edit only what you need near the top … */
+/* … truncated 1946 chars — edit only what you need near the top … */
